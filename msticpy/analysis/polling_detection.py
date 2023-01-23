@@ -346,7 +346,7 @@ class TDDSPollingDetector:
         return min(duration, 1.0)
 
     def _ts_hist_score(timestamps: npt.NDArray):
-        hist, _ = np.histogram(timestamps)
+        hist, _ = np.histogram(timestamps, bins=25)
         if len(hist) > 11:
             score1 = np.ceil(
                 (4 / len(hist)) * 1000
