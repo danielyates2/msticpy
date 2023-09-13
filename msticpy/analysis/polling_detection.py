@@ -19,9 +19,11 @@ edges pased on how frequently they occur at the same time of day/week/year.
 The TDDS (Time Delta Data Size) method requires the connection times and the data
 size (for NetFlow data this could be the number of outbound bytes). Characteristics
 of the time delta and data size distributions are combined to give an overall score.
+
+The TDDS method is a port of the RITA beaconing detection from v4.8.0.
 """
-from collections import Counter
-from typing import Tuple, Union
+from collections import Counter, OrderedDict
+from typing import Tuple, Union, Dict, List
 
 import numpy as np
 import numpy.typing as npt
@@ -181,6 +183,10 @@ class TDDSPollingDetector:
     """
     Polling detector using time delta and data size distribution characteristics.
 
+    This implementation is a translation from the RITA package written by active countermeasures.
+    Repo: https://github.com/activecm/rita
+    Beaconing detector: https://github.com/activecm/rita/blob/master/pkg/beacon/analyzer.go
+
     Methods
     -------
     detect_polling(timestamps, data_sizes)
@@ -207,8 +213,6 @@ class TDDSPollingDetector:
         Returns
         -------
         quantile: float
-            The quantile requested
-        
         """
         data = sorted(data)
 
@@ -250,7 +254,7 @@ class TDDSPollingDetector:
         
     def _median_absolute_deviation(self, data: npt.NDArray) -> float:
         """
-        Calculates the median absolute deviation (MAD) of a sample
+        Calculates the median absolute deviation (MAD) of a sample of data
 
         Parameters
         ----------
@@ -269,42 +273,84 @@ class TDDSPollingDetector:
 
         return self._get_quantile(absolute_deviation, 0.5)
 
-    def _connection_count_score(self, timestamps: npt.NDArray, jitter: float = 3600.0) -> float:
+    def _truncate_decimal(self, value: float, precision: int = 3) -> float:
         """
-        Calculates the number of connections per second
-
-        The number of connections per second must be less than one
+        Truncates a decimal to the specified precision.
+        e.g _truncate_decimal(0.123456, 3) -> 0.123
 
         Parameters
         ----------
-        timestamps: NDArray
-            The timestamps to calculate the connections per second
+        value: float
+            The number that needs to be truncated
 
         Returns
         -------
-        connections per second: float
-
+        truncated decimal: float
         """
-        conn_per_sec = len(timestamps) / ((max(timestamps) - min(timestamps)) / jitter)
+        return np.ceil(value * 10**precision) / 10**precision
 
-        return min(1.0, conn_per_sec)
+    def _smallness_score(self, bytes_list: npt.NDArray, scaling_factor: Union[int, float] = 65535.0) -> float:
+        """
+        Calculates a score for data sizes, smaller data sizes receive a higher score.
+        The scaling_factor determines how sensitive the score is
 
-    def _smallness_score(self, data: npt.NDArray, scaling_factor: Union[int, float] = 65535.0) -> float:
+        e.g a bytes list with a mode of 2 and a scaling factor of 4 will have
+        a smallness score of 0.5. If the scaling factor is increased to 32 the smallness score
+        will be 0.9375
+
+        Parameters
+        ----------
+        bytes_list: NDArray
+            Array containing byte sizes
+        
+        scaling_factor: Union[int, float]
+            How sensitive to make the scoring. Larger scaling factors will have a greater impact
+            on the score.
+        
+        Returns
+        -------
+        smallness score: float
+        """
         if scaling_factor == 0.0:
-            val_err = ValueError(
+            raise ValueError(
                 ("Value of 0 passed to scaling_factor argument. scaling_factor can be any value"
                 "other than 0")
             )
-            raise val_err
 
-        return 1.0 - (stats.mode(data) / scaling_factor)
+        mode = stats.mode(bytes_list).mode[0]
+
+        return 1.0 - (mode / scaling_factor)
     
     def _skew_score(self, data: npt.NDArray) -> float:
+        """
+        Calculates a skewness score for an array of delta times or an array of byte sizes.
+
+        Parameters
+        ----------
+        data: NDArray
+            Either a delta time array or byte size distribution
+
+        Returns
+        -------
+        skewness score: float
+        """
         skew = self._bowleys_skewness(data)
 
         return 1.0 - np.abs(skew)
 
     def _madm_score(self, data: npt.NDArray) -> float:
+        """
+        Calculates a median absolute deviation score.
+
+        Parameters
+        ----------
+        data: NDArray
+            Either a delta time array or array of byte sizes
+
+        Returns
+        -------
+        skewness score: float
+        """
         mid = self._get_quantile(data, 0.5)
         madm_score = 1.0
         if mid >= 1.0:
@@ -312,47 +358,288 @@ class TDDSPollingDetector:
         
         return max(0, madm_score)
     
-    def _ts_score(self, data: npt.NDArray) -> float:
-        skew_score = self._skew_score(data)
-        madm_score = self._madm_score(data)
-        conn_score = self._connections_per_second(data)
-        
-        return np.ceil(
-            (
-                (
-                    (skew_score + madm_score + conn_score) / 3.0
-                ) * 1000
-            ) / 1000
-        )
+    def _ts_score(self, delta_times: npt.NDArray) -> float:
+        """
+        Calculates the final ts score
 
-    def _ds_score(self, data: npt.NDArray) -> float:
-        skew_score = self._skew_score(data)
-        madm_score = self._madm_score(data)
-        smallness_score = self._smallness_score(data)
+        Parameters
+        ----------
+        delta_times: NDArray
+            Array of timestamp deltas
         
-        return np.ceil(
-            (
-                (
-                    (skew_score + madm_score + smallness_score) / 3.0
-                ) * 1000
-            ) / 1000
-        )
+        Returns
+        -------
+        ts score: float
+        """
+        skew_score = self._skew_score(delta_times)
+        madm_score = self._madm_score(delta_times)
+        
+        return self._truncate_decimal((skew_score + madm_score) / 2.0)
     
-    def _duration_score(self, timestamps: npt.NDArray, ts_start: int, ts_end: int) -> float:
-        duration = np.ceil(
-            ( ( (timestamps[-1] - timestamps[0]) / (ts_end - ts_start) ) * 1000 )  / 1000
-        )
+    def _ds_score(self, bytes_list: npt.NDArray) -> float:
+        """
+        Calculates the final ds score
 
-        return min(duration, 1.0)
+        Parameters
+        ----------
+        bytes_list: NDArray
+            Array containing bytes sizes
 
-    def _ts_hist_score(timestamps: npt.NDArray):
-        hist, _ = np.histogram(timestamps, bins=25)
-        if len(hist) > 11:
-            score1 = np.ceil(
-                (4 / len(hist)) * 1000
-            ) / 1000
-            score1 = min(1.0, score1)
+        Returns
+        -------
+        ds score: float
+        """
+        skew_score = self._skew_score(bytes_list)
+        madm_score = self._madm_score(bytes_list)
+        smallness_score = self._smallness_score(bytes_list)
         
-        score2 = np.ceil(np.std(timestamps))
-
+        return self._truncate_decimal((skew_score + madm_score + smallness_score) / 3.0)
     
+    def _duration_score(
+            self,
+            timestamps: npt.NDArray,
+            minimum: int, 
+            maximum: int,
+            total_bars: int,
+            longest_run: int,
+            min_hours_seen: int = 6,
+            consistency_ideal_hours_seen: int = 12
+        ) -> float:
+        """
+        Calculates the duration score
+
+        Parameters
+        ----------
+        timestamps: NDArray
+            Array containing timestamps
+        
+        minimum: int
+            Minimum timestamp in the whole dataset
+
+        maximum: int
+            Maximum timestamp in the whole dataset
+        
+        total_bars: int
+            Number of hours represented in the connection frequency histogram
+        
+        min_hours_seen: int
+            The threshold value of the minimum number of hours to be present in the
+            connection frequency histogram.
+
+        consistency_ideal_hours_seen: int
+            Ideal number of consecutive hours for the consistency score
+
+        Returns
+        -------
+        duration score: float
+        """
+        if total_bars > min_hours_seen:
+            coverage_score = self._truncate_decimal((timestamps[-1] - timestamps[0]) / (maximum - minimum))
+            coverage_score = min(1.0, coverage_score)
+
+            consistency_score = self._truncate_decimal(longest_run / consistency_ideal_hours_seen)
+            consistency_score = min(1.0, consistency_score)
+
+        return max(coverage_score, consistency_score)
+    
+    def _create_buckets(self, minimum: int, maximum: int, size: int = 24) -> List[int]:
+        """
+        Creates the buckets for the histogram
+
+        Parameters
+        ----------
+        minimum: int
+            Minimum value for the histogram
+
+        maximum: int
+            Maximum value for the histogram
+
+        size: int
+            The number of bins in the histogram
+        
+        Returns
+        -------
+        bucket_divs: List[int]
+            The bucket divisions for the histogram
+        """
+        total = size + 1
+        step = (maximum - minimum) / (total - 1)
+        step = np.floor(step)
+
+        bucket_divs = [minimum + (i * step) for i in range(1, total)]
+        bucket_divs = [minimum] + bucket_divs
+
+        bucket_divs[total - 1] = maximum
+
+        return bucket_divs
+    
+    def _create_histogram(self, timestamps: npt.NDArray, bucket_divs: List[int], bimodal_bucket_size: float) -> Tuple[npt.NDArray, OrderedDict, int, int, int]:
+        """
+        Creates the histogram and calculates statistics associated with the histogram
+
+        Parameters
+        ----------
+        timestamps: NDArray
+            Array containing timestamps
+
+        bucket_divs: List[int]
+            The bucket divisions for the histogram
+        
+        bimodal_bucket_size: float
+            Determines how forgiving the bimodal analysis is to variation
+
+        Returns
+        -------
+        freq: NDArray
+            The values of the histogram
+
+        freq_count:
+            Count of the number of histogram bars in each bucket for the bimodal analysis  
+        
+        total:
+            The total number of timestamps
+
+        total_bars:
+            The total number of non zero bars in the histogram
+
+        longest_run:
+            The longest number of consecutive hours observed in the connection frequency histogram
+        """
+        freq, _ = np.histogram(timestamps, bins=bucket_divs)
+
+        longest_run = 0
+        current_run = 0
+        for i in np.concatenate((freq, freq)):
+            if i > 0:
+                current_run += 1
+            else:
+                if current_run > longest_run:
+                    longest_run = current_run
+
+                current_run = 0
+        
+        if current_run > longest_run:
+            longest_run = current_run
+        
+        total = sum(freq)
+
+        total_bars = len(freq[freq != 0])
+
+        bucket_size = np.ceil(np.max(freq) * bimodal_bucket_size)
+        bucket = (np.floor(freq / bucket_size) * bucket_size).astype("int64")
+
+        bucket = bucket[bucket != 0]
+
+        freq_count = OrderedDict(sorted(Counter(bucket).items()))
+
+        return freq, freq_count, total, total_bars, longest_run
+
+    def _ts_hist_score(self, timestamps: npt.NDArray, minimum: int, maximum: int, bimodal_bucket_size: float = 0.05) -> Tuple[float, int, int]:
+        """
+        Calculate the connection frequency histogram score
+
+        Parameters
+        ----------
+        timestamps: NDArray
+            Array containing timestamps
+
+        minimum: int
+            Minimum value for the histogram
+
+        maximum: int
+            Maximum value for the histogram
+
+        bimodal_bucket_size: float
+            Determines how forgiving the bimodal analysis is to variation
+
+        Returns
+        -------
+        ts_hist_score: float
+            The largest score out of the cv_score and bimodal_fit_score
+        
+        total_bars:
+            The total number of non zero bars in the histogram
+
+        longest_run:
+            The longest number of consecutive hours observed in the connection frequency histogram
+        """
+        bucket_divs = self._create_buckets(minimum, maximum)
+
+        freq, freq_count, total, total_bars, longest_run = self._create_histogram(timestamps, bucket_divs, bimodal_bucket_size)
+
+        freq_mean = np.mean(freq)
+        freq_sd = np.std(freq)
+
+        cv = freq_sd / freq_mean
+        cv = min(1.0, cv)
+
+        cv_score = self._truncate_decimal(1.0 - cv)
+        cv_score = min(1, cv_score)
+
+        bimodal_min_hours_seen = 11
+        bimodal_outlier_removal = 1
+        if total_bars >= bimodal_min_hours_seen:
+            largest = 0
+            second_largest = 0
+            for value in freq_count.values():
+                if value > largest:
+                    second_largest = largest
+                    largest = value
+                elif value > second_largest:
+                    second_largest = value
+
+            bimodal_fit = (largest + second_largest) / max(total_bars - bimodal_outlier_removal, 1)
+
+        bimodal_fit_score = self._truncate_decimal(bimodal_fit)
+        bimodal_fit_score = min(bimodal_fit_score, 1.0)
+
+        return max(cv_score, bimodal_fit_score), total_bars, longest_run
+
+    def detect_polling(self, timestamps: npt.NDArray, bytes_list: npt.NDArray, weights: Dict[str, float]) -> float:
+        """
+        Applies the RITA beaconing detectioning algorithm developed by ActiveCountermeasures[1].
+
+        The method consists of 4 scores:
+
+            1. ts_score: 
+            2. ds_score:
+            3. hist_score: 
+            4. duration_score: 
+        
+        The output is a weighted combination of these 4 scores.
+
+        Parameters
+        ----------
+        timestamps: NDArray
+            Array containing timestamps
+        
+        bytes_list: NDArray
+            Array containing bytes sizes
+        
+        weights: Dict[str, float]
+            Dictionary of weights to apply to each score. Must sum to 1
+
+        Returns
+        -------
+        polling_score: float
+            Final score for the timestamps and bytes_list. The higher the score, the more likely it
+            is to be a beacon
+        
+        References
+        ----------
+        [1] https://github.com/activecm/rita/blob/master/pkg/beacon/analyzer.go
+        """
+        minimum = np.min(timestamps)
+        maximum = np.max(timestamps)
+
+        ts_score = self._ts_score(timestamps)
+        ds_score = self._ds_score(bytes_list)
+        hist_score, total_bars, longest_run = self._ts_hist_score(timestamps, minimum, maximum)
+        duration_score = self._duration_score(timestamps, minimum, maximum, total_bars, longest_run)
+
+        return self._truncate_decimal(
+            (ts_score * weights["ts_weight"]) +
+            (ds_score * weights["ds_weight"]) +
+            (duration_score * weights["duration_weight"]) +
+            (hist_score * weights["hist_weight"])
+        )
